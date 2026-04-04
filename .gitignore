@@ -1,29 +1,34 @@
+# Environments (ignored at any level)
 .venv/
-checkpoints/
-assets/
-output/
-depth_anything_v2/
+venv/
+env/
+.env/
 
+# Depth-Anything-V2 Artifacts (Large files and outputs)
+**/checkpoints/
+**/assets/
+**/output/
+
+
+Depth-Anything-V2/depth_anything_v2/
+
+# Python system files
 __pycache__/
 *.py[cod]
 *$py.class
 
-venv/
-env/
-.env/
-ENV/
-*.venv/
-
+# Distribution / Packaging
 dist/
 build/
 *.egg-info/
 
+# Tests and Coverage
 .pytest_cache/
 .coverage
 htmlcov/
 
+# Editor and OS specific
 .vscode/
 .idea/
-
 .DS_Store
 Thumbs.db
