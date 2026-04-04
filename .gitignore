@@ -4,13 +4,14 @@ venv/
 env/
 .env/
 
-# Depth-Anything-V2 Artifacts (Large files and outputs)
+# Depth-Anything-V2 Artifacts
 **/checkpoints/
 **/assets/
 **/output/
 
 
-Depth-Anything-V2/depth_anything_v2/
+# Depth-Anything-V2/depth_anything_v2/
+Depth-Anything-V2/
 
 # Python system files
 __pycache__/
