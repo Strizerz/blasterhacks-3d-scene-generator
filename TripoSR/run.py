@@ -137,6 +137,7 @@ else:
     rembg_session = rembg.new_session()
 
 for i, image_path in enumerate(args.image):
+    os.makedirs(os.path.join(output_dir, str(i)), exist_ok=True)
     if args.no_remove_bg:
         image = np.array(Image.open(image_path).convert("RGB"))
     else:
@@ -145,8 +146,6 @@ for i, image_path in enumerate(args.image):
         image = np.array(image).astype(np.float32) / 255.0
         image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
         image = Image.fromarray((image * 255.0).astype(np.uint8))
-        if not os.path.exists(os.path.join(output_dir, str(i))):
-            os.makedirs(os.path.join(output_dir, str(i)))
         image.save(os.path.join(output_dir, str(i), f"input.png"))
     images.append(image)
 timer.end("Processing images")
@@ -192,7 +191,7 @@ for i, image in enumerate(images):
             normals = meshes[0].vertex_normals[bake_output["vmapping"]]
             material = trimesh.visual.material.PBRMaterial(baseColorTexture=texture_img)
             visuals = trimesh.visual.TextureVisuals(uv=uvs, material=material)
-            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals, visual=visuals, process=False)
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visuals, process=False)
             mesh.export(out_mesh_path)
         else:
             xatlas.export(out_mesh_path, meshes[0].vertices[bake_output["vmapping"]], bake_output["indices"], bake_output["uvs"], meshes[0].vertex_normals[bake_output["vmapping"]])
