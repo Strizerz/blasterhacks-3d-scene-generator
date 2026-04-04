@@ -182,8 +182,21 @@ for i, image in enumerate(images):
         timer.end("Baking texture")
 
         timer.start("Exporting mesh and texture")
-        xatlas.export(out_mesh_path, meshes[0].vertices[bake_output["vmapping"]], bake_output["indices"], bake_output["uvs"], meshes[0].vertex_normals[bake_output["vmapping"]])
-        Image.fromarray((bake_output["colors"] * 255.0).astype(np.uint8)).transpose(Image.FLIP_TOP_BOTTOM).save(out_texture_path)
+        texture_img = Image.fromarray((bake_output["colors"] * 255.0).astype(np.uint8)).transpose(Image.FLIP_TOP_BOTTOM)
+        if args.model_save_format == "glb":
+            import trimesh
+            import trimesh.visual
+            vertices = meshes[0].vertices[bake_output["vmapping"]]
+            faces = bake_output["indices"]
+            uvs = bake_output["uvs"]
+            normals = meshes[0].vertex_normals[bake_output["vmapping"]]
+            material = trimesh.visual.material.PBRMaterial(baseColorTexture=texture_img)
+            visuals = trimesh.visual.TextureVisuals(uv=uvs, material=material)
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals, visual=visuals, process=False)
+            mesh.export(out_mesh_path)
+        else:
+            xatlas.export(out_mesh_path, meshes[0].vertices[bake_output["vmapping"]], bake_output["indices"], bake_output["uvs"], meshes[0].vertex_normals[bake_output["vmapping"]])
+            texture_img.save(out_texture_path)
         timer.end("Exporting mesh and texture")
     else:
         timer.start("Exporting mesh")
