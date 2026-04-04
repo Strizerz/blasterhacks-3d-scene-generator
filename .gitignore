@@ -9,7 +9,6 @@ env/
 **/assets/
 **/output/
 
-
 # Depth-Anything-V2/depth_anything_v2/
 Depth-Anything-V2/
 
@@ -34,4 +33,7 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# AI Models
 *.pt
+*.onnx
+
