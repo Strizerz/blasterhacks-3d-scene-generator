@@ -53,102 +53,192 @@ def run_depth(image_path: str, output_dir: str, encoder: str = "vitl") -> str:
     depth_color = cv2.applyColorMap(depth, cv2.COLORMAP_TURBO)
     cv2.imwrite(os.path.join(output_dir, "viz_depth.png"), depth_color)
     log.info(f"  Depth map saved: {depth_path}")
-    return depth_path
+    return depth_path, depth
+
+
+def run_3d_detection(image_path: str, depth_map: np.ndarray, output_dir: str) -> str:
+    from ultralytics import YOLO
+
+    log.info("[1.5/5] Running 3D object detection with YOLO")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    yolo = YOLO("yolov8x.pt")
+    results = yolo(image_path, conf=0.3, device=device)
+
+    img = cv2.imread(image_path)
+    h, w = img.shape[:2]
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    detections_3d = []
+    depth_normalized = depth_map.astype(np.float32) / 255.0
+
+    if results[0].boxes:
+        for box, cls, conf in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.conf):
+            x1, y1, x2, y2 = map(int, box)
+            label = results[0].names[int(cls)]
+
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            bbox_h, bbox_w = y2 - y1, x2 - x1
+
+            depth_crop = depth_normalized[y1:y2, x1:x2]
+            depth_val = np.median(depth_crop) if depth_crop.size > 0 else 0.5
+
+            z_world = (1.0 - depth_val) * DEPTH_SCALE
+            x_world = (cx / w - 0.5) * SCENE_SCALE
+            y_world = -(cy / h - 0.5) * SCENE_SCALE
+
+            size_norm = (bbox_w + bbox_h) / (w + h)
+            size_3d = size_norm * SCENE_SCALE * 2
+
+            detections_3d.append({
+                "label": label,
+                "conf": float(conf),
+                "bbox_2d": [int(x1), int(y1), int(x2), int(y2)],
+                "pos_3d": [float(x_world), float(y_world), float(z_world)],
+                "size_3d": float(size_3d),
+            })
+
+    metadata_path = os.path.join(output_dir, "detections_3d.json")
+    with open(metadata_path, "w") as f:
+        json.dump(detections_3d, f, indent=2)
+    log.info(f"  3D detections saved: {len(detections_3d)} objects")
+    return metadata_path, detections_3d
+
+
+def generate_bev(img: np.ndarray, detections_3d: list, output_dir: str):
+    log.info("[1.75/5] Generating bird's eye view")
+
+    bev_size = 800
+    bev_range = 15.0
+    bev = np.ones((bev_size, bev_size, 3), dtype=np.uint8) * 255
+
+    for det in detections_3d:
+        x, y, z = det["pos_3d"]
+        size = det["size_3d"]
+        label = det["label"]
+
+        px = int((x / bev_range + 1) * bev_size / 2)
+        py = int((y / bev_range + 1) * bev_size / 2)
+        ps = max(int(size / bev_range * bev_size / 2), 10)
+
+        color = (int(det["conf"] * 255), int(det["conf"] * 255), 200)
+        cv2.rectangle(bev, (px - ps, py - ps), (px + ps, py + ps), color, 2)
+        cv2.circle(bev, (px, py), 3, (0, 0, 255), -1)
+
+        cv2.putText(bev, label[:8], (px - 30, py - ps - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+    cv2.line(bev, (bev_size // 2 - 50, bev_size // 2), (bev_size // 2 + 50, bev_size // 2), (0, 0, 0), 1)
+    cv2.line(bev, (bev_size // 2, bev_size // 2 - 50), (bev_size // 2, bev_size // 2 + 50), (0, 0, 0), 1)
+    cv2.putText(bev, f"Range: {bev_range}m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+    bev_path = os.path.join(output_dir, "bev.png")
+    cv2.imwrite(bev_path, bev)
+    log.info(f"  Bird's eye view saved: {bev_path}")
 
 
 def run_segmentation(image_path: str, output_dir: str) -> str:
-    from ultralytics import YOLO, SAM
+    from ultralytics import SAM
 
     blobs_dir = os.path.join(output_dir, "blobs")
     os.makedirs(blobs_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    log.info("[2/5] Running YOLO + SAM segmentation")
-    yolo = YOLO(os.path.join(SAM_DIR, "yolo11x.pt"))
-    sam  = SAM(os.path.join(SAM_DIR, "sam2.1_b.pt"))
-
-    yolo_results = yolo(image_path, conf=0.25, device=device)
-    boxes  = []
-    labels = []
-    confs  = []
-    if yolo_results[0].boxes:
-        boxes  = yolo_results[0].boxes.xyxy.cpu().numpy()
-        labels = [yolo_results[0].names[int(c)] for c in yolo_results[0].boxes.cls.cpu().numpy()]
-        confs  = yolo_results[0].boxes.conf.cpu().numpy()
-
+    log.info("[2/5] Running SAM automatic segmentation with grid prompts")
     img_bgr = cv2.imread(image_path)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    all_metadata = []
-    name_counts  = {}
+    h, w = img_bgr.shape[:2]
 
+    sam = SAM(os.path.join(SAM_DIR, "sam2.1_b.pt"))
+
+    grid_step = 60
+    points = []
+    for y in range(grid_step//2, h, grid_step):
+        for x in range(grid_step//2, w, grid_step):
+            points.append([x, y])
+
+    log.info(f"  Running SAM with {len(points)} point prompts (grid {grid_step}px, batched)...")
+
+    all_sam_results = []
+    batch_size = 50
+    for batch_idx in range(0, len(points), batch_size):
+        batch_points = np.array(points[batch_idx:batch_idx + batch_size])
+        sam_results = sam(image_path, points=batch_points, device=device)
+        if sam_results[0].masks is not None:
+            all_sam_results.append(sam_results[0])
+
+    if not all_sam_results:
+        log.warning("  No objects detected by SAM.")
+        metadata_path = os.path.join(output_dir, "blobs_metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump([], f, indent=2)
+        return metadata_path
+
+    all_metadata = []
+    name_counts = {}
     PALETTE = [
         (54, 162, 235), (255, 99, 132), (75, 192, 192),
         (255, 206, 86), (153, 102, 255), (255, 159, 64),
     ]
 
-    viz_yolo = img_bgr.copy()
-    viz_sam  = img_bgr.copy()
+    viz_sam = img_bgr.copy()
     collected_masks = []
+    processed_masks = []
 
-    if len(boxes) == 0:
-        log.warning("  No YOLO detections found.")
-    else:
-        sam_results = sam(image_path, bboxes=boxes, device=device)
-        for i, (box, label, conf) in enumerate(zip(boxes, labels, confs)):
-            x1, y1, x2, y2 = map(int, box)
-            color = PALETTE[i % len(PALETTE)]
+    for sam_result in all_sam_results:
+        if sam_result.masks is None:
+            continue
 
-            mask = None
-            if sam_results[0].masks is not None and i < len(sam_results[0].masks.data):
-                mask = sam_results[0].masks.data[i].cpu().numpy().astype(np.uint8) * 255
-            if mask is None or mask.sum() == 0:
-                mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
-                mask[y1:y2, x1:x2] = 255
-
-            ys, xs = np.where(mask > 0)
-            if len(xs) == 0:
+        for mask_tensor in sam_result.masks.data:
+            seg = (mask_tensor.cpu().numpy().astype(np.uint8) * 255)
+            ys, xs = np.where(seg > 0)
+            if len(xs) < 100:
                 continue
+
             mx1, my1, mx2, my2 = xs.min(), ys.min(), xs.max(), ys.max()
 
+            is_duplicate = False
+            for prev_seg, *_ in processed_masks:
+                intersection = np.sum((seg > 0) & (prev_seg > 0))
+                union = np.sum((seg > 0) | (prev_seg > 0))
+                iou = intersection / (union + 1e-6)
+                if iou > 0.7:
+                    is_duplicate = True
+                    break
+
+            if is_duplicate:
+                continue
+
+            processed_masks.append((seg, mx1, my1, mx2, my2))
+            color = PALETTE[len(processed_masks) % len(PALETTE)]
+            label = "object"
             name_counts[label] = name_counts.get(label, 0) + 1
             file_name = f"{label}_{name_counts[label]}.png"
+
             r, g, b = cv2.split(img_rgb)
-            rgba = cv2.merge([r, g, b, mask])
+            rgba = cv2.merge([r, g, b, seg])
             cropped = rgba[my1:my2, mx1:mx2]
             cv2.imwrite(os.path.join(blobs_dir, file_name), cv2.cvtColor(cropped, cv2.COLOR_RGBA2BGRA))
 
             all_metadata.append({
                 "label": label,
                 "file": file_name,
-                "yolo_conf": float(conf),
-                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "yolo_conf": 0.9,
+                "bbox": [int(mx1), int(my1), int(mx2), int(my2)],
                 "mask_bbox": [int(mx1), int(my1), int(mx2), int(my2)],
             })
             log.info(f"  Saved blob: {file_name}")
-            collected_masks.append((mask, color, label, conf, x1, y1, x2, y2))
+            collected_masks.append((seg, color, label, 0.9, mx1, my1, mx2, my2))
 
-            cv2.rectangle(viz_yolo, (x1, y1), (x2, y2), color, 2)
-            txt = f"{label} {conf:.2f}"
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-            cv2.rectangle(viz_yolo, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(viz_yolo, txt, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-
-    for mask, color, label, conf, x1, y1, x2, y2 in collected_masks:
+    for seg, color, label, conf, x1, y1, x2, y2 in collected_masks:
         overlay = viz_sam.copy()
-        overlay[mask > 0] = color
+        overlay[seg > 0] = color
         cv2.addWeighted(overlay, 0.45, viz_sam, 0.55, 0, viz_sam)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(viz_sam, contours, -1, color, 2)
-        txt = f"{label} {conf:.2f}"
-        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        cv2.rectangle(viz_sam, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(viz_sam, txt, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
-    cv2.imwrite(os.path.join(output_dir, "viz_yolo.png"), viz_yolo)
     cv2.imwrite(os.path.join(output_dir, "viz_sam.png"), viz_sam)
-    log.info(f"  Saved viz_yolo.png and viz_sam.png")
+    log.info(f"  Saved viz_sam.png")
 
     metadata_path = os.path.join(output_dir, "blobs_metadata.json")
     with open(metadata_path, "w") as f:
@@ -294,9 +384,9 @@ def run_triposr_on_blob(model, rembg_session, blob_path: str, out_dir: str,
 def assemble_scene(metadata: list, blobs_dir: str, meshes_dir: str,
                    triposr_model, rembg_session, device: str,
                    img_w: int, img_h: int, texture_res: int,
-                   sd_pipe=None) -> trimesh.Scene:
+                   sd_pipe=None):
     log.info("[5/5] Assembling scene")
-    scene = trimesh.Scene()
+    all_meshes = []
 
     for obj in metadata:
         log.info(f"  [{obj['label']}] {obj['file']}")
@@ -318,6 +408,11 @@ def assemble_scene(metadata: list, blobs_dir: str, meshes_dir: str,
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
 
+        mesh.apply_translation(-mesh.bounding_box.centroid)
+
+        rot = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+        mesh.apply_transform(rot)
+
         x1, y1, x2, y2 = obj["bbox"]
         bbox_diag  = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
         img_diag   = (img_w ** 2 + img_h ** 2) ** 0.5
@@ -331,15 +426,14 @@ def assemble_scene(metadata: list, blobs_dir: str, meshes_dir: str,
         y_world = -(cy / img_h - 0.5) * SCENE_SCALE
         z_world = (1.0 - obj["depth"]["median"] / 255.0) * DEPTH_SCALE
 
-        transform = trimesh.transformations.scale_and_translate(
-            scale=[scale, scale, scale],
-            translate=[x_world, y_world, z_world],
-        )
-        scene.add_geometry(mesh, transform=transform,
-                           node_name=f"{obj['label']}_{obj['file']}")
+        mesh.apply_scale(scale)
+        mesh.apply_translation([x_world, y_world, z_world])
+        all_meshes.append(mesh)
         log.info(f"    pos=({x_world:.2f}, {y_world:.2f}, {z_world:.2f})  scale={scale:.3f}")
 
-    return scene
+    if not all_meshes:
+        return None
+    return trimesh.util.concatenate(all_meshes)
 
 
 if __name__ == "__main__":
@@ -358,7 +452,11 @@ if __name__ == "__main__":
     img = cv2.imread(args.image)
     img_h, img_w = img.shape[:2]
 
-    depth_path = run_depth(args.image, args.output_dir, args.encoder)
+    depth_path, depth_map = run_depth(args.image, args.output_dir, args.encoder)
+
+    det_3d_path, detections_3d = run_3d_detection(args.image, depth_map, args.output_dir)
+
+    generate_bev(img, detections_3d, args.output_dir)
 
     metadata_path = run_segmentation(args.image, args.output_dir)
 
@@ -379,14 +477,14 @@ if __name__ == "__main__":
 
     blobs_dir  = os.path.join(args.output_dir, "blobs")
     meshes_dir = os.path.join(args.output_dir, "meshes")
-    scene = assemble_scene(metadata, blobs_dir, meshes_dir,
-                           triposr_model, rembg_session, device,
-                           img_w, img_h, args.texture_res,
-                           sd_pipe=sd_pipe)
+    mesh = assemble_scene(metadata, blobs_dir, meshes_dir,
+                          triposr_model, rembg_session, device,
+                          img_w, img_h, args.texture_res,
+                          sd_pipe=sd_pipe)
 
     scene_path = os.path.join(args.output_dir, "scene.glb")
-    if len(scene.geometry) == 0:
+    if mesh is None:
         log.error("No objects were successfully processed — scene is empty.")
         sys.exit(1)
-    scene.export(scene_path)
-    log.info(f"\nDone. Scene saved to: {scene_path}  ({len(scene.geometry)} objects)")
+    mesh.export(scene_path)
+    log.info(f"\nDone. Scene saved to: {scene_path}  ({len(metadata)} objects)")

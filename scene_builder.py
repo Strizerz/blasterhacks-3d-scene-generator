@@ -1,185 +1,397 @@
-"""
-scene_builder.py
-
-Reads SAM output (blobs_metadata.json + blob PNGs), runs TripoSR on each
-detected object, then assembles a single GLB scene with objects placed
-according to their image position and depth.
-
-Usage:
-    python scene_builder.py --metadata SAM/output/blobs_metadata.json
-                            --blobs-dir SAM/output/blobs
-                            --output-dir output/scene
-                            --scene-out output/scene/scene.glb
-
-Depth map convention (Depth-Anything): higher value = closer to camera.
-Objects are placed on a Z axis where closer objects have smaller Z.
-"""
-
-import argparse
-import json
-import logging
 import os
 import sys
-
+import json
+import subprocess
 import numpy as np
-import torch
-import trimesh
-import trimesh.visual
-from PIL import Image
+import cv2
+from PIL import Image as PILImage
 
-# --- TripoSR imports ---
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "TripoSR"))
-from tsr.system import TSR
-from tsr.utils import remove_background, resize_foreground
-from tsr.bake_texture import bake_texture
+TRIPOSR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TripoSR")
+HUNYUAN3D_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Hunyuan3D-2")
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
-log = logging.getLogger(__name__)
+# Lazy-loaded Hunyuan3D pipelines (loaded once, reused for all objects)
+_hunyuan_shapegen = None
+_hunyuan_texgen = None
+_hunyuan_rembg = None
 
-IMG_W = 1200
-IMG_H = 1200
-SCENE_SCALE = 10.0      # world units across the full image width
-DEPTH_SCALE = 8.0       # world units from nearest to farthest object
+PLANE_CLASSES = {
+    "floor", "ground", "carpet", "rug", "mat",
+    "ceiling", "roof",
+    "wall", "room", "background",
+    "road", "pavement", "sidewalk", "pathway", "path", "dirt path", "gravel",
+    "sky", "water", "river", "pond", "pool", "lake",
+    "grass", "lawn",
+}
 
-
-def depth_to_z(depth_median: float) -> float:
-    """Convert 0-255 depth value to world Z. Higher depth = closer = smaller Z."""
-    # depth 255 → z = 0 (closest), depth 0 → z = DEPTH_SCALE (farthest)
-    return (1.0 - depth_median / 255.0) * DEPTH_SCALE
-
-
-def bbox_to_xy(bbox: list) -> tuple:
-    """Convert pixel bbox [x1,y1,x2,y2] to centred world XY coordinates."""
-    x1, y1, x2, y2 = bbox
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    x_world = (cx / IMG_W - 0.5) * SCENE_SCALE
-    y_world = -(cy / IMG_H - 0.5) * SCENE_SCALE   # flip Y for 3D
-    return x_world, y_world
+PLANE_NORMALS = {
+    "floor": "up", "ground": "up", "carpet": "up", "rug": "up", "mat": "up",
+    "grass": "up", "lawn": "up", "road": "up", "pavement": "up",
+    "sidewalk": "up", "pathway": "up", "path": "up", "dirt path": "up", "gravel": "up",
+    "water": "up", "river": "up", "pond": "up", "pool": "up", "lake": "up",
+    "ceiling": "down", "roof": "down",
+    "wall": "forward", "room": "forward", "background": "forward", "sky": "forward",
+}
 
 
-def bbox_size_scale(bbox: list) -> float:
-    """Estimate a rough scale factor based on object size in image."""
-    x1, y1, x2, y2 = bbox
-    diag = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-    img_diag = (IMG_W ** 2 + IMG_H ** 2) ** 0.5
-    return (diag / img_diag) * SCENE_SCALE * 1.5
+def estimate_world_scale(bbox_2d, depth_value, image_wh, fov_deg=60.0):
+    """
+    Estimate the real-world size of an object from its 2D bbox and depth.
+
+    Larger bbox at same depth = bigger object.
+    Same bbox at farther depth = bigger object (perspective).
+
+    Returns (width_m, height_m) in metres.
+    """
+    img_w, img_h = image_wh
+    x1, y1, x2, y2 = bbox_2d
+    bbox_w_px = x2 - x1
+    bbox_h_px = y2 - y1
+
+    distance_m = 1.0 + (1.0 - depth_value) * 9.0
+
+    fov_rad = np.radians(fov_deg)
+    sensor_half_w = 2.0 * distance_m * np.tan(fov_rad / 2.0)
+    px_to_m = sensor_half_w / img_w
+
+    width_m  = bbox_w_px * px_to_m
+    height_m = bbox_h_px * px_to_m
+
+    return round(float(width_m), 4), round(float(height_m), 4)
 
 
-def run_triposr(model, image_path: str, output_dir: str, texture_resolution: int = 1024) -> str:
-    """Run TripoSR on a single image and return path to output GLB."""
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, "mesh.glb")
-
-    if os.path.exists(out_path):
-        log.info(f"  Cached: {out_path}")
-        return out_path
-
-    image = Image.open(image_path)
-
-    # Remove background if image has no alpha
-    if image.mode != "RGBA":
-        image = remove_background(image, rembg_session)
-    image = resize_foreground(image, 0.85)
-
-    with torch.no_grad():
-        scene_codes = model([image], device=device)
-
-    meshes = model.extract_mesh(scene_codes, resolution=256)
-
-    bake_out = bake_texture(meshes[0], model, scene_codes[0], texture_resolution)
-    texture_img = Image.fromarray(
-        (bake_out["colors"] * 255.0).astype(np.uint8)
-    ).transpose(Image.FLIP_TOP_BOTTOM)
-
-    vertices = meshes[0].vertices[bake_out["vmapping"]]
-    faces = bake_out["indices"]
-    uvs = bake_out["uvs"]
-
-    material = trimesh.visual.material.PBRMaterial(baseColorTexture=texture_img)
-    visuals = trimesh.visual.TextureVisuals(uv=uvs, material=material)
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, visual=visuals, process=False)
-    mesh.export(out_path)
-
-    log.info(f"  Exported: {out_path}")
-    return out_path
+def _find_mesh(search_dir):
+    for root, dirs, files in os.walk(search_dir):
+        for f in files:
+            if f.endswith((".glb", ".obj", ".ply")):
+                return os.path.join(root, f)
+    return None
 
 
-def build_scene(metadata: list, blobs_dir: str, meshes_dir: str) -> trimesh.Scene:
-    scene = trimesh.Scene()
+def run_triposr(crop_path, mesh_output_dir):
+    abs_out = os.path.abspath(mesh_output_dir)
+    cached = _find_mesh(abs_out)
+    if cached:
+        print(f"    Cached: {cached}")
+        return cached
+    os.makedirs(abs_out, exist_ok=True)
+    subprocess.run(
+        [
+            sys.executable, "run.py",
+            os.path.abspath(crop_path),
+            "--output-dir", abs_out,
+            "--no-remove-bg",
+        ],
+        cwd=TRIPOSR_DIR,
+        check=True,
+    )
+    result = _find_mesh(abs_out)
+    if result is None:
+        raise FileNotFoundError(f"TripoSR produced no mesh in {abs_out}")
+    return result
 
-    for obj in metadata:
-        label = obj["label"]
-        blob_file = obj["file"]
-        bbox = obj["bbox"]
-        depth_median = obj["depth"]["median"]
 
-        log.info(f"Processing: {label} ({blob_file})")
+def _load_hunyuan3d(device="cuda"):
+    global _hunyuan_shapegen, _hunyuan_texgen, _hunyuan_rembg
 
-        blob_path = os.path.join(blobs_dir, blob_file)
-        obj_output_dir = os.path.join(meshes_dir, os.path.splitext(blob_file)[0])
+    if _hunyuan_shapegen is not None:
+        return _hunyuan_shapegen, _hunyuan_texgen, _hunyuan_rembg
 
+    # Add Hunyuan3D-2 to path so hy3dgen can be imported
+    if HUNYUAN3D_DIR not in sys.path:
+        sys.path.insert(0, HUNYUAN3D_DIR)
+
+    # Ensure CUDA DLLs from torch are findable (Windows needs this for custom extensions)
+    import torch
+    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    if hasattr(os, "add_dll_directory") and os.path.isdir(torch_lib):
+        os.add_dll_directory(torch_lib)
+
+    # Ensure custom_rasterizer egg is importable (kernel DLL needs torch DLLs above)
+    cr_egg = os.path.join(
+        os.path.dirname(torch.__file__), "..",
+        "custom_rasterizer-0.1-py3.12-win-amd64.egg"
+    )
+    cr_egg = os.path.normpath(cr_egg)
+    if os.path.isdir(cr_egg) and cr_egg not in sys.path:
+        sys.path.insert(0, cr_egg)
+    try:
+        import custom_rasterizer_kernel  # noqa: F401
+        import custom_rasterizer  # noqa: F401
+        print("  custom_rasterizer loaded OK")
+    except Exception as e:
+        print(f"  custom_rasterizer pre-import failed: {e}")
+
+    from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+    from hy3dgen.rembg import BackgroundRemover
+
+    print("  Loading Hunyuan3D shape generator...")
+    _hunyuan_shapegen = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained("tencent/Hunyuan3D-2")
+    _hunyuan_rembg = BackgroundRemover()
+
+    try:
+        from hy3dgen.texgen import Hunyuan3DPaintPipeline
+        print("  Loading Hunyuan3D texture painter...")
+        _hunyuan_texgen = Hunyuan3DPaintPipeline.from_pretrained("tencent/Hunyuan3D-2")
+        print("  Texture painter loaded.")
+    except Exception as e:
+        print(f"  Texture painter unavailable ({e}), will generate untextured meshes.")
+        _hunyuan_texgen = None
+
+    return _hunyuan_shapegen, _hunyuan_texgen, _hunyuan_rembg
+
+
+def run_hunyuan3d(crop_path, mesh_output_dir, device="cuda"):
+    abs_out = os.path.abspath(mesh_output_dir)
+    cached = _find_mesh(abs_out)
+    if cached:
+        print(f"    Cached: {cached}")
+        return cached
+    os.makedirs(abs_out, exist_ok=True)
+
+    shapegen, texgen, rembg = _load_hunyuan3d(device)
+
+    image = PILImage.open(crop_path)
+    if image.mode == "RGB":
+        image = rembg(image.convert("RGBA"))
+    else:
+        image = image.convert("RGBA")
+
+    mesh = shapegen(image=image)[0]
+
+    if texgen is not None:
         try:
-            glb_path = run_triposr(triposr_model, blob_path, obj_output_dir)
+            mesh = texgen(mesh, image=image)
         except Exception as e:
-            log.warning(f"  TripoSR failed for {blob_file}: {e}")
+            print(f"    Texture painting failed ({e}), exporting untextured mesh.")
+
+    glb_path = os.path.join(abs_out, "mesh.glb")
+    mesh.export(glb_path)
+
+    result = _find_mesh(abs_out)
+    if result is None:
+        raise FileNotFoundError(f"Hunyuan3D produced no mesh in {abs_out}")
+    return result
+
+
+def segment_and_extract(image_path, boxes_3d, crops_dir, device="cuda"):
+    import torch
+    from ultralytics import SAM
+
+    os.makedirs(crops_dir, exist_ok=True)
+
+    print("  Loading SAM...")
+    sam = SAM("sam2_b.pt")
+
+    frame_bgr = cv2.imread(image_path)
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    h, w = frame_rgb.shape[:2]
+
+    crop_paths = []
+    seg_vis = frame_bgr.copy()
+    rng = np.random.default_rng(42)
+    colors = [tuple(int(c) for c in rng.integers(80, 255, 3)) for _ in boxes_3d]
+
+    for idx, box_3d in enumerate(boxes_3d):
+        class_name = box_3d["class_name"]
+        x1, y1, x2, y2 = [int(c) for c in box_3d["bbox_2d"]]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        color = colors[idx]
+
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            print(f"  [{idx}] {class_name} — bbox too small, skipping")
+            crop_paths.append(None)
             continue
 
-        mesh = trimesh.load(glb_path, force="scene")
-        if isinstance(mesh, trimesh.Scene):
-            mesh = mesh.dump(concatenate=True)
+        mask = None
+        try:
+            results = sam(image_path, bboxes=[[x1, y1, x2, y2]], device=device, verbose=False)
+            if results and results[0].masks is not None:
+                masks = results[0].masks.data.cpu().numpy()
+                if len(masks) > 0:
+                    mask = masks[0].astype(bool)
+        except Exception as e:
+            print(f"  [{idx}] {class_name} — SAM error: {e}")
 
-        # Normalise mesh to unit size then scale by bbox size
-        extents = mesh.bounding_box.extents
-        max_extent = max(extents) if max(extents) > 0 else 1.0
-        target_scale = bbox_size_scale(bbox)
-        scale = target_scale / max_extent
+        if mask is not None:
+            overlay = seg_vis.copy()
+            overlay[mask] = (overlay[mask].astype(np.float32) * 0.5 +
+                             np.array(color, dtype=np.float32) * 0.5).astype(np.uint8)
+            seg_vis = overlay
+            contours, _ = cv2.findContours(mask.astype(np.uint8),
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(seg_vis, contours, -1, color, 2)
 
-        x, y = bbox_to_xy(bbox)
-        z = depth_to_z(depth_median)
+        cv2.rectangle(seg_vis, (x1, y1), (x2, y2), color, 1)
+        cv2.putText(seg_vis, class_name[:14], (x1, max(y1 - 4, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-        transform = trimesh.transformations.scale_and_translate(
-            scale=[scale, scale, scale],
-            translate=[x, y, z]
+        rgba = np.zeros((h, w, 4), dtype=np.float32)
+        rgba[:, :, :3] = frame_rgb.astype(np.float32) / 255.0
+        if mask is not None:
+            rgba[:, :, 3] = mask.astype(np.float32)
+        else:
+            rgba[y1:y2, x1:x2, 3] = 1.0
+
+        rgb_comp = rgba[:, :, :3] * rgba[:, :, 3:4] + (1 - rgba[:, :, 3:4]) * 0.5
+        composite = (rgb_comp * 255).astype(np.uint8)
+
+        pad = 10
+        cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+        cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+        crop = composite[cy1:cy2, cx1:cx2]
+
+        safe_name = class_name.replace(" ", "_").replace("/", "_")
+        crop_path = os.path.join(crops_dir, f"{idx:03d}_{safe_name}.png")
+        PILImage.fromarray(crop).save(crop_path)
+        crop_paths.append(crop_path)
+        print(f"  [{idx}] {class_name} → {os.path.basename(crop_path)}")
+
+    del sam
+    torch.cuda.empty_cache()
+
+    return crop_paths, seg_vis
+
+
+def _find_existing_crops(boxes_3d, crops_dir):
+    """Find existing crop images on disk, return list matching boxes_3d order."""
+    crop_paths = []
+    for idx, box_3d in enumerate(boxes_3d):
+        safe_name = box_3d["class_name"].replace(" ", "_").replace("/", "_")
+        path = os.path.join(crops_dir, f"{idx:03d}_{safe_name}.png")
+        crop_paths.append(path if os.path.exists(path) else None)
+    return crop_paths
+
+
+def build_scene(image_path, boxes_3d, output_dir, device="cuda",
+                skip_mesh_gen=False, reuse_existing=False, generator="hunyuan3d"):
+    print("\n=== Building Scene ===")
+
+    crops_dir  = os.path.join(output_dir, "crops")
+    meshes_dir = os.path.join(output_dir, "meshes")
+    os.makedirs(meshes_dir, exist_ok=True)
+
+    frame = cv2.imread(image_path)
+    img_h, img_w = frame.shape[:2]
+
+    if reuse_existing and os.path.isdir(crops_dir):
+        print(f"Reusing existing crops from {crops_dir}")
+        crop_paths = _find_existing_crops(boxes_3d, crops_dir)
+        found = sum(1 for p in crop_paths if p is not None)
+        print(f"  Found {found}/{len(boxes_3d)} existing crops")
+        seg_vis = None
+    else:
+        print(f"Segmenting {len(boxes_3d)} objects with SAM...")
+        crop_paths, seg_vis = segment_and_extract(image_path, boxes_3d, crops_dir, device)
+        cv2.imwrite(os.path.join(output_dir, "viz_sam.png"), seg_vis)
+        print(f"  SAM visualization → viz_sam.png")
+
+    use_hunyuan = generator == "hunyuan3d" and os.path.isdir(HUNYUAN3D_DIR)
+    if generator == "hunyuan3d" and not os.path.isdir(HUNYUAN3D_DIR):
+        print(f"  Hunyuan3D-2 not found at {HUNYUAN3D_DIR}, falling back to TripoSR")
+        use_hunyuan = False
+
+    gen_name = "Hunyuan3D" if use_hunyuan else "TripoSR"
+    print(f"  3D generator: {gen_name}")
+
+    scene_objects = []
+
+    for idx, (box_3d, crop_path) in enumerate(zip(boxes_3d, crop_paths)):
+        class_name = box_3d["class_name"]
+        loc  = box_3d["location"]
+        dims = box_3d["dimensions"]
+        safe_name = class_name.replace(" ", "_").replace("/", "_")
+        is_plane = class_name.lower().strip() in PLANE_CLASSES
+        plane_normal = PLANE_NORMALS.get(class_name.lower().strip(), "up") if is_plane else None
+        obj_type = "plane" if is_plane else "mesh"
+
+        world_w, world_h = estimate_world_scale(
+            box_3d["bbox_2d"], box_3d["depth_value"], (img_w, img_h)
         )
-        scene.add_geometry(mesh, transform=transform, node_name=f"{label}_{blob_file}")
-        log.info(f"  Placed at ({x:.2f}, {y:.2f}, {z:.2f}), scale={scale:.3f}")
 
-    return scene
+        mesh_rel = None
+        if not is_plane:
+            mesh_out = os.path.join(meshes_dir, f"{idx:03d}_{safe_name}")
+            # Check for already-generated mesh on disk
+            existing = _find_mesh(mesh_out) if os.path.isdir(mesh_out) else None
+            if existing:
+                mesh_rel = os.path.relpath(existing, output_dir).replace("\\", "/")
+                print(f"  [{idx}] {class_name} → cached {mesh_rel}")
+            elif crop_path is not None and not skip_mesh_gen:
+                print(f"  {gen_name} [{idx}] {class_name}...")
+                try:
+                    if use_hunyuan:
+                        mesh_abs = run_hunyuan3d(crop_path, mesh_out, device)
+                    else:
+                        mesh_abs = run_triposr(crop_path, mesh_out)
+                    mesh_rel = os.path.relpath(mesh_abs, output_dir).replace("\\", "/")
+                    print(f"    → {mesh_rel}")
+                except Exception as e:
+                    print(f"    {gen_name} failed: {e}")
+                    if use_hunyuan:
+                        print(f"    Falling back to TripoSR...")
+                        try:
+                            mesh_abs = run_triposr(crop_path, mesh_out)
+                            mesh_rel = os.path.relpath(mesh_abs, output_dir).replace("\\", "/")
+                            print(f"    → {mesh_rel}")
+                        except Exception as e2:
+                            print(f"    TripoSR also failed: {e2}")
+            else:
+                print(f"  [{idx}] {class_name} → no mesh (skipped)")
+        else:
+            print(f"  [{idx}] {class_name} → plane")
 
+        entry = {
+            "id":           idx,
+            "type":         obj_type,
+            "class_name":   class_name,
+            "score":        round(float(box_3d["score"]), 3),
+            "mesh_path":    mesh_rel,
+            "crop_path":    os.path.relpath(crop_path, output_dir).replace("\\", "/") if crop_path else None,
+            "position": {
+                "x": round(float(loc[0]), 4),
+                "y": round(float(loc[1]), 4),
+                "z": round(float(loc[2]), 4),
+            },
+            "rotation_y_deg":       round(float(np.degrees(box_3d["orientation"])), 2),
+            "scale": {
+                "width":  world_w,
+                "height": world_h,
+                "depth":  round(min(world_w, world_h), 4),
+            },
+            "dimensions": {
+                "height": round(float(dims[0]), 4),
+                "width":  round(float(dims[1]), 4),
+                "length": round(float(dims[2]), 4),
+            },
+            "height_from_ground_m": round(float(box_3d.get("height_from_gnd", 0.0)), 4),
+            "depth_value":          round(float(box_3d["depth_value"]), 4),
+            "bbox_2d":              [int(c) for c in box_3d["bbox_2d"]],
+        }
+        if is_plane:
+            entry["plane_normal"] = plane_normal
+        scene_objects.append(entry)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--metadata", default="SAM/output/blobs_metadata.json")
-    parser.add_argument("--blobs-dir", default="SAM/output/blobs")
-    parser.add_argument("--output-dir", default="output/scene/meshes")
-    parser.add_argument("--scene-out", default="output/scene/scene.glb")
-    parser.add_argument("--texture-resolution", type=int, default=1024)
-    parser.add_argument("--device", default="cuda:0")
-    args = parser.parse_args()
+    json_path = os.path.join(output_dir, "scene.json")
+    with open(json_path, "w") as f:
+        json.dump({
+            "scene":        os.path.basename(output_dir),
+            "source_image": os.path.abspath(image_path).replace("\\", "/"),
+            "image_size":   [img_w, img_h],
+            "generator":    gen_name,
+            "object_count": len(scene_objects),
+            "objects":      scene_objects,
+        }, f, indent=2)
 
-    device = args.device if torch.cuda.is_available() else "cpu"
+    # Free Hunyuan3D VRAM if it was loaded
+    global _hunyuan_shapegen, _hunyuan_texgen, _hunyuan_rembg
+    if _hunyuan_shapegen is not None:
+        import torch
+        del _hunyuan_shapegen, _hunyuan_texgen, _hunyuan_rembg
+        _hunyuan_shapegen = _hunyuan_texgen = _hunyuan_rembg = None
+        torch.cuda.empty_cache()
 
-    # Load rembg session for background removal
-    import rembg
-    rembg_session = rembg.new_session()
+    print(f"\nScene JSON → {json_path}")
+    print(f"Objects with meshes: {sum(1 for o in scene_objects if o['mesh_path'])}/{len(scene_objects)}")
 
-    # Load TripoSR model
-    log.info("Loading TripoSR model...")
-    triposr_model = TSR.from_pretrained(
-        "stabilityai/TripoSR",
-        config_name="config.yaml",
-        weight_name="model.ckpt",
-    )
-    triposr_model.renderer.set_chunk_size(8192)
-    triposr_model.to(device)
-    log.info("Model loaded.")
-
-    with open(args.metadata) as f:
-        metadata = json.load(f)
-
-    os.makedirs(os.path.dirname(args.scene_out), exist_ok=True)
-
-    scene = build_scene(metadata, args.blobs_dir, args.output_dir)
-    scene.export(args.scene_out)
-    log.info(f"\nScene saved to: {args.scene_out} ({len(scene.geometry)} objects)")
+    return scene_objects
