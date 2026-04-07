@@ -1,8 +1,4 @@
 """
-blender_import.py
-
-Imports a scene.json produced by the pipeline into Blender.
-
 Usage (inside Blender Script Editor):
     1. Open Blender
     2. Go to the Scripting workspace
@@ -12,12 +8,6 @@ Usage (inside Blender Script Editor):
 
 Usage (command line, headless):
     blender --python blender_import.py -- --scene output/dining/scene.json
-
-Coordinate conversion:
-    Pipeline camera space  →  Blender world space
-    X (right)              →  X (right)
-    Y (down, scaled)       →  Z (up, negated)
-    Z (depth)              →  Y (forward)
 """
 
 import bpy
@@ -28,12 +18,10 @@ import json
 import os
 import sys
 
-# ─────────────────────────────────────────────
-#  CONFIGURE THIS when running from Script Editor
-# ─────────────────────────────────────────────
+
 SCENE_JSON  = r"output/dining/scene.json"
 CLEAR_SCENE = True
-# ─────────────────────────────────────────────
+
 
 PLANE_COLORS = {
     "floor":    (0.40, 0.30, 0.20, 1),
@@ -63,7 +51,7 @@ def dominant_color_from_crop(crop_path):
         from PIL import Image
         img = Image.open(crop_path).convert("RGB")
         pixels = list(img.getdata())
-        # Filter out the gray background (RGB ~128,128,128 from the 0.5 composite)
+ 
         fg_pixels = [p for p in pixels if not (120 < p[0] < 136 and 120 < p[1] < 136 and 120 < p[2] < 136)]
         if not fg_pixels:
             fg_pixels = pixels
@@ -249,7 +237,6 @@ def create_plane_object(entry):
 
 
 def add_camera_light():
-    # Simple sun lamp for visibility
     bpy.ops.object.light_add(type="SUN", location=(0, -5, 5))
     sun = bpy.context.active_object
     sun.name = "SceneSun"
